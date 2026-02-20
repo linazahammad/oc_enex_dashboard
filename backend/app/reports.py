@@ -1,0 +1,1265 @@
+from collections import defaultdict
+from datetime import date, datetime, timedelta
+from threading import Lock
+import time
+from typing import Any, Dict, List, Sequence
+
+from fastapi import HTTPException, status
+
+from .config import settings
+from .db import get_cursor
+
+_SCHEMA_CACHE: dict[str, Any] | None = None
+_SCHEMA_LOCK = Lock()
+
+_MAPPING_CACHE: dict[str, Any] | None = None
+_MAPPING_LOCK = Lock()
+_MAPPING_CACHE_TTL_SECONDS = 300
+
+_NAME_COLUMN_CANDIDATES = (
+    "EmployeeName",
+    "EnglishName",
+    "Name",
+    "EmpName",
+    "EName",
+    "UserName",
+    "User",
+)
+_DEPARTMENT_COLUMN_CANDIDATES = (
+    "Department",
+    "DepartmentName",
+    "DeptName",
+    "Dept",
+    "DepName",
+)
+
+
+def _format_dt(value: datetime | None) -> str | None:
+    return value.strftime("%Y-%m-%d %H:%M:%S") if value else None
+
+
+def _minutes_to_hhmm(value: int | None) -> str | None:
+    if value is None or value < 0:
+        return None
+    hours = value // 60
+    minutes = value % 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def format_duration_readable(minutes: int | None) -> str | None:
+    if minutes is None:
+        return None
+    hrs = minutes // 60
+    mins = minutes % 60
+    if hrs <= 0:
+        return f"{mins:02d} Mins"
+    return f"{hrs} Hrs {mins:02d} Mins"
+
+
+def _duration_minutes(first_in: datetime | None, last_out: datetime | None) -> int | None:
+    if not first_in or not last_out or last_out < first_in:
+        return None
+    delta = last_out - first_in
+    return int(delta.total_seconds() // 60)
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _normalize_inout_flag(value: Any) -> int | None:
+    parsed = _to_int(value)
+    if parsed == 1:
+        return 1
+    if parsed == 0:
+        return 0
+    return None
+
+
+def _parse_date(date_value: str) -> date:
+    try:
+        return datetime.strptime(date_value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date must be in YYYY-MM-DD format",
+        ) from exc
+
+
+def _month_bounds(month_value: str) -> tuple[datetime, datetime, str]:
+    try:
+        start = datetime.strptime(month_value, "%Y-%m")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="month must be in YYYY-MM format",
+        ) from exc
+
+    if start.month == 12:
+        end = datetime(start.year + 1, 1, 1)
+    else:
+        end = datetime(start.year, start.month + 1, 1)
+
+    return start, end, start.strftime("%Y-%m")
+
+
+def _year_bounds(year_value: str) -> tuple[datetime, datetime, str]:
+    try:
+        year_int = int(year_value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="year must be numeric YYYY",
+        ) from exc
+
+    if year_int < 1900 or year_int > 2100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="year is out of accepted range",
+        )
+
+    start = datetime(year_int, 1, 1)
+    end = datetime(year_int + 1, 1, 1)
+    return start, end, str(year_int)
+
+
+def _pick_first(existing: set[str], candidates: Sequence[str]) -> str | None:
+    lowered = {column.lower(): column for column in existing}
+    for candidate in candidates:
+        found = lowered.get(candidate.lower())
+        if found:
+            return found
+    return None
+
+
+def _columns_of_with_cursor(cursor: Any, table_name: str) -> set[str]:
+    cursor.execute(
+        """
+        SELECT COLUMN_NAME AS ColumnName
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = %s
+        """,
+        (table_name,),
+    )
+    rows = cursor.fetchall()
+    columns: set[str] = set()
+    for row in rows:
+        value = row.get("ColumnName")
+        if value:
+            columns.add(str(value))
+    return columns
+
+
+def _columns_of(table_name: str) -> set[str]:
+    with get_cursor() as cursor:
+        return _columns_of_with_cursor(cursor, table_name)
+
+
+def _resolve_schema(cursor: Any) -> dict[str, Any]:
+    employee_columns = _columns_of_with_cursor(cursor, "TEmployee")
+    event_columns = _columns_of_with_cursor(cursor, "TEvent")
+    event_type_columns = _columns_of_with_cursor(cursor, "TEventType")
+
+    return {
+        "employee_columns": employee_columns,
+        "event_columns": event_columns,
+        "event_type_columns": event_type_columns,
+        "employee_name_col": _pick_first(employee_columns, _NAME_COLUMN_CANDIDATES),
+        "employee_department_col": _pick_first(employee_columns, _DEPARTMENT_COLUMN_CANDIDATES),
+        "employee_emp_id_col": _pick_first(employee_columns, ("EmpID",)) or "EmpID",
+        "employee_card_col": _pick_first(employee_columns, ("CardNo",)) or "CardNo",
+        "employee_emp_enable_col": _pick_first(employee_columns, ("EmpEnable",)) or "EmpEnable",
+        "employee_deleted_col": _pick_first(employee_columns, ("Deleted",)) or "Deleted",
+        "employee_leave_col": _pick_first(employee_columns, ("Leave",)) or "Leave",
+        "employee_is_visitor_col": _pick_first(employee_columns, ("isVisitor", "IsVisitor"))
+        or "isVisitor",
+        "event_emp_id_col": _pick_first(event_columns, ("EmpID",)),
+        "event_card_col": _pick_first(event_columns, ("CardNo",)),
+        "event_time_col": _pick_first(event_columns, ("EventTime",)),
+    }
+
+
+def _get_schema() -> dict[str, Any]:
+    global _SCHEMA_CACHE
+
+    with _SCHEMA_LOCK:
+        if _SCHEMA_CACHE is not None:
+            return _SCHEMA_CACHE
+
+    with get_cursor() as cursor:
+        resolved = _resolve_schema(cursor)
+
+    with _SCHEMA_LOCK:
+        if _SCHEMA_CACHE is None:
+            _SCHEMA_CACHE = resolved
+        return _SCHEMA_CACHE
+
+
+def _active_employee_where(alias: str, schema: dict[str, Any]) -> str:
+    emp_enable_col = schema["employee_emp_enable_col"] or "EmpEnable"
+    deleted_col = schema["employee_deleted_col"] or "Deleted"
+    leave_col = schema["employee_leave_col"] or "Leave"
+    visitor_col = schema["employee_is_visitor_col"] or "isVisitor"
+    card_col = schema["employee_card_col"] or "CardNo"
+
+    return (
+        f"{alias}.[{emp_enable_col}] = 1 "
+        f"AND ({alias}.[{deleted_col}] = 0 OR {alias}.[{deleted_col}] IS NULL) "
+        f"AND ({alias}.[{leave_col}] = 0 OR {alias}.[{leave_col}] IS NULL) "
+        f"AND ({alias}.[{visitor_col}] = 0 OR {alias}.[{visitor_col}] IS NULL) "
+        f"AND ({alias}.[{card_col}] IS NOT NULL AND {alias}.[{card_col}] <> 0)"
+    )
+
+
+def _employee_name_expr_for_alias(alias: str, schema: dict[str, Any]) -> str:
+    name_col = schema.get("employee_name_col")
+    if not name_col:
+        return "''"
+    return f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(255), {alias}.[{name_col}]), '')))"
+
+
+def _employee_department_expr_for_alias(alias: str, schema: dict[str, Any]) -> str:
+    dept_col = schema.get("employee_department_col")
+    if not dept_col:
+        return "''"
+    return f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(255), {alias}.[{dept_col}]), '')))"
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _employee_name_or_card(row_name: Any, fallback_card_no: str) -> str:
+    name = _clean_text(row_name)
+    return name or fallback_card_no
+
+
+def _normalize_emp_id(value: Any, fallback_card_no: str) -> int | str:
+    if value is None:
+        return fallback_card_no
+    if isinstance(value, int):
+        return value
+
+    raw = _clean_text(value)
+    if not raw:
+        return fallback_card_no
+
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def _entry_exit_case(expr: str) -> str:
+    return (
+        "CASE "
+        f"WHEN CONVERT(VARCHAR(255), {expr}) LIKE 'Entry%' THEN 1 "
+        f"WHEN CONVERT(VARCHAR(255), {expr}) LIKE 'Exit%' THEN 0 "
+        "ELSE NULL END"
+    )
+
+
+def _normalized_inout_case(raw_expr: str, fallback_text_expr: str | None = None) -> str:
+    parts = [
+        "CASE",
+        f"WHEN {raw_expr} = 1 THEN 1",
+        f"WHEN {raw_expr} = 0 THEN 0",
+        f"WHEN {raw_expr} = 2 THEN 0",
+        f"WHEN {raw_expr} = -1 THEN 0",
+        f"WHEN UPPER(LTRIM(RTRIM(CONVERT(VARCHAR(255), {raw_expr})))) IN ('IN', 'I', 'ENTRY', 'ENTER') THEN 1",
+        f"WHEN UPPER(LTRIM(RTRIM(CONVERT(VARCHAR(255), {raw_expr})))) IN ('OUT', 'O', 'EXIT', 'LEAVE') THEN 0",
+        f"WHEN CONVERT(VARCHAR(255), {raw_expr}) LIKE 'Entry%' THEN 1",
+        f"WHEN CONVERT(VARCHAR(255), {raw_expr}) LIKE 'Exit%' THEN 0",
+    ]
+
+    if fallback_text_expr:
+        parts.append(
+            f"WHEN CONVERT(VARCHAR(255), {fallback_text_expr}) LIKE 'Entry%' THEN 1"
+        )
+        parts.append(
+            f"WHEN CONVERT(VARCHAR(255), {fallback_text_expr}) LIKE 'Exit%' THEN 0"
+        )
+
+    parts.append("ELSE NULL END")
+    return " ".join(parts)
+
+
+def _detect_event_variant(
+    event_alias: str = "e",
+    event_type_alias: str = "et",
+) -> dict[str, str]:
+    schema = _get_schema()
+    event_columns: set[str] = schema.get("event_columns", set())
+    event_type_columns: set[str] = schema.get("event_type_columns", set())
+
+    tevent_event_type_col = _pick_first(event_columns, ("EventType",))
+    tevent_event_id_col = _pick_first(event_columns, ("EventID",))
+    tevent_inout_col = _pick_first(event_columns, ("InOut",))
+    tevent_event_text_col = _pick_first(event_columns, ("Event",))
+
+    tetype_event_id_col = _pick_first(event_type_columns, ("EventID",))
+    tetype_inout_col = _pick_first(event_type_columns, ("InOut",))
+    tetype_event_text_col = _pick_first(event_type_columns, ("Event",))
+
+    if tevent_event_type_col and tetype_event_id_col:
+        join_sql = (
+            f"LEFT JOIN [TEventType] {event_type_alias} "
+            f"ON {event_alias}.[{tevent_event_type_col}] = {event_type_alias}.[{tetype_event_id_col}]"
+        )
+
+        if tetype_inout_col:
+            inout_expr = _normalized_inout_case(
+                f"{event_type_alias}.[{tetype_inout_col}]",
+                f"{event_type_alias}.[{tetype_event_text_col}]" if tetype_event_text_col else None,
+            )
+        elif tetype_event_text_col:
+            inout_expr = _entry_exit_case(f"{event_type_alias}.[{tetype_event_text_col}]")
+        else:
+            inout_expr = "NULL"
+
+        return {
+            "variant": "EVENTTYPE_to_EventID",
+            "join_sql": join_sql,
+            "inout_expr": inout_expr,
+        }
+
+    if tevent_event_id_col and tetype_event_id_col:
+        join_sql = (
+            f"LEFT JOIN [TEventType] {event_type_alias} "
+            f"ON {event_alias}.[{tevent_event_id_col}] = {event_type_alias}.[{tetype_event_id_col}]"
+        )
+
+        if tetype_inout_col:
+            inout_expr = _normalized_inout_case(
+                f"{event_type_alias}.[{tetype_inout_col}]",
+                f"{event_type_alias}.[{tetype_event_text_col}]" if tetype_event_text_col else None,
+            )
+        elif tetype_event_text_col:
+            inout_expr = _entry_exit_case(f"{event_type_alias}.[{tetype_event_text_col}]")
+        else:
+            inout_expr = "NULL"
+
+        return {
+            "variant": "EVENTID_to_EventID",
+            "join_sql": join_sql,
+            "inout_expr": inout_expr,
+        }
+
+    if tevent_inout_col:
+        return {
+            "variant": "TEVENT_InOut_only",
+            "join_sql": "",
+            "inout_expr": _normalized_inout_case(f"{event_alias}.[{tevent_inout_col}]"),
+        }
+
+    if tevent_event_text_col:
+        return {
+            "variant": "TEVENT_Event_text_only",
+            "join_sql": "",
+            "inout_expr": _entry_exit_case(f"{event_alias}.[{tevent_event_text_col}]"),
+        }
+
+    return {
+        "variant": "UNSUPPORTED",
+        "join_sql": "",
+        "inout_expr": "NULL",
+    }
+
+
+def _fetch_employee_identity(card_no: str) -> Dict[str, Any]:
+    schema = _get_schema()
+    employee_emp_id_col = schema["employee_emp_id_col"] or "EmpID"
+    employee_card_col = schema["employee_card_col"] or "CardNo"
+    active_where = _active_employee_where("emp", schema)
+    employee_name_expr = _employee_name_expr_for_alias("emp", schema)
+    department_expr = _employee_department_expr_for_alias("emp", schema)
+
+    sql = f"""
+        SELECT TOP 1
+            emp.[{employee_emp_id_col}] AS EmpID,
+            CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
+            {employee_name_expr} AS EmployeeName,
+            {department_expr} AS Department
+        FROM [TEmployee] emp
+        WHERE {active_where}
+          AND CONVERT(VARCHAR(64), emp.[{employee_card_col}]) = %s
+        ORDER BY EmployeeName, CardNo
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql, (card_no,))
+        row = cursor.fetchone() or {}
+
+    normalized_card_no = _clean_text(row.get("CardNo")) or card_no
+    employee_name = _employee_name_or_card(row.get("EmployeeName"), normalized_card_no)
+    emp_id = _normalize_emp_id(row.get("EmpID"), normalized_card_no)
+    department = _clean_text(row.get("Department")) or None
+
+    return {
+        "emp_id": emp_id,
+        "card_no": normalized_card_no,
+        "employee_name": employee_name,
+        "department": department,
+    }
+
+
+def fetch_employees(search: str) -> List[Dict[str, Any]]:
+    schema = _get_schema()
+    employee_emp_id_col = schema["employee_emp_id_col"] or "EmpID"
+    employee_card_col = schema["employee_card_col"] or "CardNo"
+    active_where = _active_employee_where("emp", schema)
+    employee_name_expr = _employee_name_expr_for_alias("emp", schema)
+
+    sql = f"""
+        SELECT TOP 200
+            emp.[{employee_emp_id_col}] AS EmpID,
+            CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
+            {employee_name_expr} AS EmployeeName
+        FROM [TEmployee] emp
+        WHERE {active_where}
+    """
+
+    params: tuple[str, ...] = ()
+    if search:
+        wildcard = f"%{search}%"
+        sql += f"""
+          AND (
+              {employee_name_expr} LIKE %s
+              OR CONVERT(VARCHAR(64), emp.[{employee_card_col}]) LIKE %s
+          )
+        """
+        params = (wildcard, wildcard)
+
+    sql += """
+        ORDER BY EmployeeName, CardNo
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+
+    employees: List[Dict[str, Any]] = []
+    for row in rows:
+        card_no = _clean_text(row.get("CardNo"))
+        if not card_no:
+            continue
+        employee_name = _employee_name_or_card(row.get("EmployeeName"), card_no)
+        emp_id = _normalize_emp_id(row.get("EmpID"), card_no)
+        employees.append(
+            {
+                "emp_id": emp_id,
+                "card_no": card_no,
+                "employee_name": employee_name,
+            }
+        )
+
+    return employees
+
+
+def fetch_dashboard_summary() -> Dict[str, Any]:
+    schema = _get_schema()
+    employee_card_col = schema.get("employee_card_col") or "CardNo"
+    event_card_col = schema.get("event_card_col")
+    event_time_col = schema.get("event_time_col")
+    active_where = _active_employee_where("emp", schema)
+
+    total_sql = f"""
+        SELECT COUNT(1) AS TotalEmployees
+        FROM [TEmployee] emp
+        WHERE {active_where}
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(total_sql)
+        total_row = cursor.fetchone() or {}
+
+    total = int(total_row.get("TotalEmployees") or 0)
+
+    if not event_card_col or not event_time_col:
+        return {
+            "totalEmployees": total,
+            "inCount": 0,
+            "outCount": 0,
+            "unknownCount": total,
+            "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    detector = _detect_event_variant(event_alias="e2", event_type_alias="et2")
+    if detector["variant"] == "UNSUPPORTED":
+        return {
+            "totalEmployees": total,
+            "inCount": 0,
+            "outCount": 0,
+            "unknownCount": total,
+            "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    sql = f"""
+        SELECT
+            COUNT(1) AS TotalEmployees,
+            SUM(CASE WHEN summary.LastInOut = 1 THEN 1 ELSE 0 END) AS InCount,
+            SUM(CASE WHEN summary.LastInOut = 0 THEN 1 ELSE 0 END) AS OutCount,
+            SUM(CASE WHEN summary.LastInOut IS NULL THEN 1 ELSE 0 END) AS UnknownCount
+        FROM (
+            SELECT
+                CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
+                (
+                    SELECT TOP 1 {detector['inout_expr']}
+                    FROM [TEvent] e2
+                    {detector['join_sql']}
+                    WHERE CONVERT(VARCHAR(64), e2.[{event_card_col}]) = CONVERT(VARCHAR(64), emp.[{employee_card_col}])
+                    ORDER BY e2.[{event_time_col}] DESC
+                ) AS LastInOut
+            FROM [TEmployee] emp
+            WHERE {active_where}
+        ) summary
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql)
+        row = cursor.fetchone() or {}
+
+    in_count = int(row.get("InCount") or 0)
+    out_count = int(row.get("OutCount") or 0)
+    unknown_count = int(row.get("UnknownCount") or max(total - in_count - out_count, 0))
+
+    return {
+        "totalEmployees": total,
+        "inCount": in_count,
+        "outCount": out_count,
+        "unknownCount": unknown_count,
+        "generatedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _fetch_recent_mapping_sample(
+    limit: int = 200,
+    detector: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    schema = _get_schema()
+    event_time_col = schema.get("event_time_col")
+    if not event_time_col:
+        return []
+
+    resolved_detector = detector or _detect_event_variant(event_alias="e", event_type_alias="et")
+    if resolved_detector["variant"] == "UNSUPPORTED":
+        return []
+
+    sql = f"""
+        SELECT TOP {int(limit)}
+            e.[{event_time_col}] AS EventTime,
+            {resolved_detector['inout_expr']} AS InOutFlag
+        FROM [TEvent] e
+        {resolved_detector['join_sql']}
+        WHERE e.[{event_time_col}] IS NOT NULL
+        ORDER BY e.[{event_time_col}] DESC
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+
+    sample: list[dict[str, Any]] = []
+    for row in rows:
+        event_time = row.get("EventTime")
+        if not isinstance(event_time, datetime):
+            continue
+        sample.append(
+            {
+                "event_time": event_time,
+                "inout_flag": _normalize_inout_flag(row.get("InOutFlag")),
+            }
+        )
+
+    return sample
+
+
+def _should_auto_swap(sample: Sequence[dict[str, Any]]) -> bool:
+    valid = [row for row in sample if row.get("inout_flag") in {0, 1}]
+    if len(valid) < 50:
+        # Not enough usable IN/OUT rows => disable heuristic swap detection.
+        return False
+
+    in_total = 0
+    in_early = 0
+    out_total = 0
+    out_afternoon_evening = 0
+
+    for row in valid:
+        event_time = row.get("event_time")
+        flag = row.get("inout_flag")
+        if not isinstance(event_time, datetime):
+            continue
+
+        hour = event_time.hour
+        if flag == 1:
+            in_total += 1
+            if 0 <= hour <= 6:
+                in_early += 1
+        elif flag == 0:
+            out_total += 1
+            if 12 <= hour <= 23:
+                out_afternoon_evening += 1
+
+    if in_total == 0 or out_total == 0:
+        return False
+
+    in_ratio = in_early / in_total
+    out_ratio = out_afternoon_evening / out_total
+    return in_ratio > 0.60 and out_ratio > 0.60
+
+
+def _get_mapping_state(detector: dict[str, str] | None = None) -> dict[str, Any]:
+    global _MAPPING_CACHE
+
+    resolved_detector = detector or _detect_event_variant(event_alias="e", event_type_alias="et")
+    detector_variant = resolved_detector["variant"]
+
+    if detector_variant == "UNSUPPORTED":
+        return {
+            "mappingVariant": "unsupported",
+            "swapApplied": False,
+            "detectorVariant": detector_variant,
+            "autoDetected": False,
+            "manualOverride": False,
+        }
+
+    if bool(settings.inout_swap):
+        return {
+            "mappingVariant": "swapped",
+            "swapApplied": True,
+            "detectorVariant": detector_variant,
+            "autoDetected": False,
+            "manualOverride": True,
+        }
+
+    now = time.time()
+    with _MAPPING_LOCK:
+        cached = _MAPPING_CACHE
+        if cached and (now - float(cached.get("ts") or 0)) < _MAPPING_CACHE_TTL_SECONDS:
+            if cached.get("detectorVariant") == detector_variant:
+                return {
+                    "mappingVariant": str(cached.get("mappingVariant") or "normal"),
+                    "swapApplied": bool(cached.get("swapApplied")),
+                    "detectorVariant": detector_variant,
+                    "autoDetected": bool(cached.get("autoDetected")),
+                    "manualOverride": False,
+                }
+
+    sample = _fetch_recent_mapping_sample(limit=200, detector=resolved_detector)
+    auto_swapped = _should_auto_swap(sample)
+
+    state = {
+        "mappingVariant": "swapped" if auto_swapped else "normal",
+        "swapApplied": auto_swapped,
+        "detectorVariant": detector_variant,
+        "autoDetected": auto_swapped,
+        "manualOverride": False,
+    }
+
+    with _MAPPING_LOCK:
+        _MAPPING_CACHE = {
+            "ts": now,
+            "mappingVariant": state["mappingVariant"],
+            "swapApplied": state["swapApplied"],
+            "detectorVariant": detector_variant,
+            "autoDetected": state["autoDetected"],
+        }
+
+    return state
+
+
+def _fetch_events_for_card(
+    card_no: str,
+    start: datetime,
+    end: datetime,
+    detector: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    schema = _get_schema()
+    event_card_col = schema.get("event_card_col")
+    event_time_col = schema.get("event_time_col")
+    if not event_card_col or not event_time_col:
+        return []
+
+    resolved_detector = detector or _detect_event_variant(event_alias="e", event_type_alias="et")
+    if resolved_detector["variant"] == "UNSUPPORTED":
+        return []
+
+    sql = f"""
+        SELECT
+            e.[{event_time_col}] AS EventTime,
+            {resolved_detector['inout_expr']} AS InOutFlag
+        FROM [TEvent] e
+        {resolved_detector['join_sql']}
+        WHERE CONVERT(VARCHAR(64), e.[{event_card_col}]) = %s
+          AND e.[{event_time_col}] >= %s
+          AND e.[{event_time_col}] < %s
+        ORDER BY e.[{event_time_col}] ASC
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql, (card_no, start, end))
+        rows = cursor.fetchall()
+
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        event_time = row.get("EventTime")
+        if not isinstance(event_time, datetime):
+            continue
+        events.append(
+            {
+                "event_time": event_time,
+                "inout_flag": _normalize_inout_flag(row.get("InOutFlag")),
+            }
+        )
+
+    return events
+
+
+def _fetch_last_event_before(
+    card_no: str,
+    boundary: datetime,
+    detector: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
+    schema = _get_schema()
+    event_card_col = schema.get("event_card_col")
+    event_time_col = schema.get("event_time_col")
+    if not event_card_col or not event_time_col:
+        return None
+
+    resolved_detector = detector or _detect_event_variant(event_alias="e", event_type_alias="et")
+    if resolved_detector["variant"] == "UNSUPPORTED":
+        return None
+
+    sql = f"""
+        SELECT TOP 1
+            e.[{event_time_col}] AS EventTime,
+            {resolved_detector['inout_expr']} AS InOutFlag
+        FROM [TEvent] e
+        {resolved_detector['join_sql']}
+        WHERE CONVERT(VARCHAR(64), e.[{event_card_col}]) = %s
+          AND e.[{event_time_col}] < %s
+        ORDER BY e.[{event_time_col}] DESC
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql, (card_no, boundary))
+        row = cursor.fetchone() or {}
+
+    event_time = row.get("EventTime")
+    if not isinstance(event_time, datetime):
+        return None
+
+    return {
+        "event_time": event_time,
+        "inout_flag": _normalize_inout_flag(row.get("InOutFlag")),
+    }
+
+
+def _event_state(event: dict[str, Any], swap_applied: bool) -> int | None:
+    flag = event.get("inout_flag")
+    if flag not in {0, 1}:
+        return None
+    if not swap_applied:
+        return int(flag)
+    return 0 if flag == 1 else 1
+
+
+def _accumulate_segment_minutes(
+    day_totals: dict[str, dict[str, int]],
+    *,
+    state: int,
+    segment_start: datetime,
+    segment_end: datetime,
+    window_start: datetime,
+    window_end: datetime,
+) -> None:
+    clipped_start = max(segment_start, window_start)
+    clipped_end = min(segment_end, window_end)
+    if clipped_end <= clipped_start:
+        return
+
+    cursor = clipped_start
+    while cursor < clipped_end:
+        next_day = datetime(cursor.year, cursor.month, cursor.day) + timedelta(days=1)
+        chunk_end = min(clipped_end, next_day)
+        minutes = int((chunk_end - cursor).total_seconds() // 60)
+        if minutes > 0:
+            day_key = cursor.strftime("%Y-%m-%d")
+            bucket = day_totals.setdefault(day_key, {"in_minutes": 0, "out_minutes": 0})
+            if state == 1:
+                bucket["in_minutes"] += minutes
+            elif state == 0:
+                bucket["out_minutes"] += minutes
+        cursor = chunk_end
+
+
+def _compute_period_segment_totals(
+    *,
+    card_no: str,
+    start: datetime,
+    end: datetime,
+    swap_applied: bool,
+    detector: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if end <= start:
+        return {
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "per_day": {},
+        }
+
+    resolved_detector = detector or _detect_event_variant(event_alias="e", event_type_alias="et")
+    if resolved_detector["variant"] == "UNSUPPORTED":
+        return {
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "per_day": {},
+        }
+
+    timeline = _fetch_events_for_card(
+        card_no=card_no,
+        start=start,
+        end=end,
+        detector=resolved_detector,
+    )
+    anchor = _fetch_last_event_before(
+        card_no=card_no,
+        boundary=start,
+        detector=resolved_detector,
+    )
+    if anchor is not None:
+        timeline.insert(0, anchor)
+
+    if not timeline:
+        return {
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "per_day": {},
+        }
+
+    timeline.sort(key=lambda item: item["event_time"])
+
+    day_totals: dict[str, dict[str, int]] = {}
+    state: int | None = None
+    segment_start: datetime | None = None
+
+    for event in timeline:
+        event_time = event.get("event_time")
+        if not isinstance(event_time, datetime):
+            continue
+
+        next_state = _event_state(event, swap_applied)
+        if next_state is None:
+            continue
+
+        if state is None:
+            state = next_state
+            segment_start = event_time
+            continue
+
+        if next_state == state:
+            continue
+
+        if segment_start is not None:
+            _accumulate_segment_minutes(
+                day_totals,
+                state=state,
+                segment_start=segment_start,
+                segment_end=event_time,
+                window_start=start,
+                window_end=end,
+            )
+
+        state = next_state
+        segment_start = event_time
+
+    total_in_minutes = sum(bucket["in_minutes"] for bucket in day_totals.values())
+    total_out_minutes = sum(bucket["out_minutes"] for bucket in day_totals.values())
+
+    return {
+        "totalInMinutes": total_in_minutes,
+        "totalOutMinutes": total_out_minutes,
+        "totalInHHMM": _minutes_to_hhmm(total_in_minutes),
+        "totalOutHHMM": _minutes_to_hhmm(total_out_minutes),
+        "per_day": day_totals,
+    }
+
+
+def _is_in_event(event: dict[str, Any], swap_applied: bool) -> bool:
+    flag = event.get("inout_flag")
+    if flag not in {0, 1}:
+        return False
+    effective = 0 if (swap_applied and flag == 1) else 1 if (swap_applied and flag == 0) else flag
+    return effective == 1
+
+
+def _is_out_event(event: dict[str, Any], swap_applied: bool) -> bool:
+    flag = event.get("inout_flag")
+    if flag not in {0, 1}:
+        return False
+    effective = 0 if (swap_applied and flag == 1) else 1 if (swap_applied and flag == 0) else flag
+    return effective == 0
+
+
+def _compute_day_attendance(
+    *,
+    day_start: datetime,
+    day_events: Sequence[dict[str, Any]],
+    swap_applied: bool,
+) -> dict[str, Any]:
+    cutoff_hours = settings.shift_out_cutoff_hours
+    day_end = day_start + timedelta(days=1)
+    overnight_end = day_end + timedelta(hours=cutoff_hours)
+
+    in_primary: list[datetime] = []
+    out_primary: list[datetime] = []
+
+    for event in day_events:
+        event_time = event["event_time"]
+        if event_time < day_start or event_time >= day_end:
+            continue
+
+        if _is_in_event(event, swap_applied):
+            in_primary.append(event_time)
+        elif _is_out_event(event, swap_applied):
+            out_primary.append(event_time)
+
+    first_in = min(in_primary) if in_primary else None
+    last_out: datetime | None = None
+
+    if first_in is not None:
+        outs_after_in = [
+            event["event_time"]
+            for event in day_events
+            if first_in <= event["event_time"] < overnight_end and _is_out_event(event, swap_applied)
+        ]
+        if outs_after_in:
+            last_out = max(outs_after_in)
+
+        # Sanity checks: never keep negative duration results.
+        if last_out is not None and last_out < first_in:
+            next_out: datetime | None = None
+            last_out_after_in: datetime | None = None
+            for event in day_events:
+                event_time = event["event_time"]
+                if event_time < first_in or event_time >= overnight_end:
+                    continue
+                if not _is_out_event(event, swap_applied):
+                    continue
+                if next_out is None:
+                    next_out = event_time
+                last_out_after_in = event_time
+            last_out = last_out_after_in or next_out
+    else:
+        # OUT-only day => missing punch.
+        last_out = max(out_primary) if out_primary else None
+
+    duration_minutes = _duration_minutes(first_in, last_out)
+    if first_in is not None and last_out is not None and duration_minutes is None:
+        # Never return negative durations; treat as missing pairing.
+        last_out = None
+
+    missing_punch = (first_in is None) ^ (last_out is None)
+    has_relevant_events = bool(in_primary or out_primary)
+
+    return {
+        "date": day_start.strftime("%Y-%m-%d"),
+        "first_in_dt": first_in,
+        "last_out_dt": last_out,
+        "duration_minutes": duration_minutes,
+        "duration_hhmm": _minutes_to_hhmm(duration_minutes),
+        "missing_punch": missing_punch,
+        "has_relevant_events": has_relevant_events,
+    }
+
+
+def _serialize_day_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date": record["date"],
+        "first_in": _format_dt(record.get("first_in_dt")),
+        "last_out": _format_dt(record.get("last_out_dt")),
+        "duration_minutes": record.get("duration_minutes"),
+        "duration_hhmm": record.get("duration_hhmm"),
+        "missing_punch": bool(record.get("missing_punch")),
+    }
+
+
+def _build_daily_records_for_period(
+    *,
+    card_no: str,
+    start: datetime,
+    end: datetime,
+    swap_applied: bool,
+    detector: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    extended_end = end + timedelta(days=1, hours=settings.shift_out_cutoff_hours)
+    events = _fetch_events_for_card(
+        card_no=card_no,
+        start=start,
+        end=extended_end,
+        detector=detector,
+    )
+
+    records: list[dict[str, Any]] = []
+    total_events = len(events)
+    start_idx = 0
+    end_idx = 0
+
+    day_cursor = start
+    while day_cursor < end:
+        day_end = day_cursor + timedelta(days=1)
+        overnight_end = day_end + timedelta(hours=settings.shift_out_cutoff_hours)
+
+        while start_idx < total_events and events[start_idx]["event_time"] < day_cursor:
+            start_idx += 1
+
+        if end_idx < start_idx:
+            end_idx = start_idx
+
+        while end_idx < total_events and events[end_idx]["event_time"] < overnight_end:
+            end_idx += 1
+
+        day_events = events[start_idx:end_idx]
+        day_record = _compute_day_attendance(
+            day_start=day_cursor,
+            day_events=day_events,
+            swap_applied=swap_applied,
+        )
+
+        if day_record["has_relevant_events"]:
+            records.append(_serialize_day_record(day_record))
+
+        day_cursor = day_end
+
+    return records
+
+
+def _build_single_day_record(
+    *,
+    card_no: str,
+    selected_date: date,
+    swap_applied: bool,
+    detector: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    day_start = datetime.combine(selected_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    overnight_end = day_end + timedelta(hours=settings.shift_out_cutoff_hours)
+
+    events = _fetch_events_for_card(
+        card_no=card_no,
+        start=day_start,
+        end=overnight_end,
+        detector=detector,
+    )
+    day_record = _compute_day_attendance(
+        day_start=day_start,
+        day_events=events,
+        swap_applied=swap_applied,
+    )
+    return _serialize_day_record(day_record)
+
+
+def fetch_daily_report(card_no: str, date_value: str) -> Dict[str, Any]:
+    selected_date = _parse_date(date_value)
+    detector = _detect_event_variant(event_alias="e", event_type_alias="et")
+    mapping = _get_mapping_state(detector=detector)
+    identity = _fetch_employee_identity(card_no)
+
+    day_record = _build_single_day_record(
+        card_no=card_no,
+        selected_date=selected_date,
+        swap_applied=bool(mapping["swapApplied"]),
+        detector=detector,
+    )
+    day_start = datetime.combine(selected_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    period_totals = _compute_period_segment_totals(
+        card_no=card_no,
+        start=day_start,
+        end=day_end,
+        swap_applied=bool(mapping["swapApplied"]),
+        detector=detector,
+    )
+
+    return {
+        "employee_name": identity["employee_name"],
+        "card_no": identity["card_no"],
+        "department": identity["department"],
+        "date": day_record["date"],
+        "first_in": day_record["first_in"],
+        "last_out": day_record["last_out"],
+        "duration_minutes": day_record["duration_minutes"],
+        "duration_hhmm": day_record["duration_hhmm"],
+        "missing_punch": day_record["missing_punch"],
+        "totalInMinutes": period_totals["totalInMinutes"],
+        "totalOutMinutes": period_totals["totalOutMinutes"],
+        "totalInHHMM": period_totals["totalInHHMM"],
+        "totalOutHHMM": period_totals["totalOutHHMM"],
+        "total_work_minutes": day_record["duration_minutes"],
+        "mappingVariant": mapping["mappingVariant"],
+        "swapApplied": mapping["swapApplied"],
+    }
+
+
+def fetch_monthly_report(card_no: str, month_value: str) -> Dict[str, Any]:
+    start, end, normalized_month = _month_bounds(month_value)
+    detector = _detect_event_variant(event_alias="e", event_type_alias="et")
+    mapping = _get_mapping_state(detector=detector)
+    identity = _fetch_employee_identity(card_no)
+
+    records = _build_daily_records_for_period(
+        card_no=card_no,
+        start=start,
+        end=end,
+        swap_applied=bool(mapping["swapApplied"]),
+        detector=detector,
+    )
+    period_totals = _compute_period_segment_totals(
+        card_no=card_no,
+        start=start,
+        end=end,
+        swap_applied=bool(mapping["swapApplied"]),
+        detector=detector,
+    )
+
+    total_minutes = sum(item["duration_minutes"] or 0 for item in records)
+    total_days = sum(1 for item in records if item.get("first_in"))
+    missing_punch_days = sum(1 for item in records if bool(item.get("missing_punch")))
+
+    return {
+        "employee_name": identity["employee_name"],
+        "card_no": identity["card_no"],
+        "department": identity["department"],
+        "month": normalized_month,
+        "records": records,
+        "total_days": total_days,
+        "missing_punch_days": missing_punch_days,
+        "total_minutes": total_minutes,
+        "total_duration_hhmm": _minutes_to_hhmm(total_minutes),
+        "total_duration_readable": format_duration_readable(total_minutes),
+        "totalInMinutes": period_totals["totalInMinutes"],
+        "totalOutMinutes": period_totals["totalOutMinutes"],
+        "totalInHHMM": period_totals["totalInHHMM"],
+        "totalOutHHMM": period_totals["totalOutHHMM"],
+        "total_work_minutes": total_minutes,
+        "mappingVariant": mapping["mappingVariant"],
+        "swapApplied": mapping["swapApplied"],
+    }
+
+
+def fetch_yearly_report(card_no: str, year_value: str) -> Dict[str, Any]:
+    start, end, normalized_year = _year_bounds(year_value)
+    detector = _detect_event_variant(event_alias="e", event_type_alias="et")
+    mapping = _get_mapping_state(detector=detector)
+    identity = _fetch_employee_identity(card_no)
+
+    daily_records = _build_daily_records_for_period(
+        card_no=card_no,
+        start=start,
+        end=end,
+        swap_applied=bool(mapping["swapApplied"]),
+        detector=detector,
+    )
+    period_totals = _compute_period_segment_totals(
+        card_no=card_no,
+        start=start,
+        end=end,
+        swap_applied=bool(mapping["swapApplied"]),
+        detector=detector,
+    )
+
+    month_map: dict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "worked_days": 0,
+            "duration_days": 0,
+            "missing_punch_days": 0,
+            "total_minutes": 0,
+        }
+    )
+
+    for record in daily_records:
+        month_key = record["date"][:7]
+
+        if record.get("first_in"):
+            month_map[month_key]["worked_days"] += 1
+
+        if record.get("missing_punch"):
+            month_map[month_key]["missing_punch_days"] += 1
+
+        duration = record["duration_minutes"]
+        if duration is None:
+            continue
+
+        month_map[month_key]["duration_days"] += 1
+        month_map[month_key]["total_minutes"] += duration
+
+    months: List[Dict[str, Any]] = []
+    total_worked_days = 0
+    total_missing_punch_days = 0
+    total_minutes = 0
+
+    for month_key in sorted(month_map.keys()):
+        worked_days = month_map[month_key]["worked_days"]
+        duration_days = month_map[month_key]["duration_days"]
+        missing_punch_days = month_map[month_key]["missing_punch_days"]
+        month_minutes = month_map[month_key]["total_minutes"]
+
+        total_worked_days += worked_days
+        total_missing_punch_days += missing_punch_days
+        total_minutes += month_minutes
+
+        average = int(month_minutes / duration_days) if duration_days else None
+
+        months.append(
+            {
+                "month": month_key,
+                "worked_days": worked_days,
+                "missing_punch_days": missing_punch_days,
+                "total_minutes": month_minutes,
+                "average_minutes_per_day": average,
+                "average_duration_hhmm": _minutes_to_hhmm(average),
+                "total_duration_hhmm": _minutes_to_hhmm(month_minutes),
+                "total_duration_readable": format_duration_readable(month_minutes),
+            }
+        )
+
+    return {
+        "employee_name": identity["employee_name"],
+        "card_no": identity["card_no"],
+        "department": identity["department"],
+        "year": normalized_year,
+        "months": months,
+        "total_worked_days": total_worked_days,
+        "missing_punch_days": total_missing_punch_days,
+        "total_minutes": total_minutes,
+        "total_duration_hhmm": _minutes_to_hhmm(total_minutes),
+        "total_duration_readable": format_duration_readable(total_minutes),
+        "totalInMinutes": period_totals["totalInMinutes"],
+        "totalOutMinutes": period_totals["totalOutMinutes"],
+        "totalInHHMM": period_totals["totalInHHMM"],
+        "totalOutHHMM": period_totals["totalOutHHMM"],
+        "total_work_minutes": total_minutes,
+        "mappingVariant": mapping["mappingVariant"],
+        "swapApplied": mapping["swapApplied"],
+    }

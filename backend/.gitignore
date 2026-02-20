@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets (VERY IMPORTANT for production)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Runtime files
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Build / temp
+dist/
+build/
+tmp/
+temp/
+uploads/
+
+# Database (if any local dumps)
+*.sqlite
+*.db
+*.sql
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
